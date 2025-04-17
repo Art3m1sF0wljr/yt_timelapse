@@ -347,4 +347,3 @@ if __name__ == "__main__":
         logger.info("Script stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-app
