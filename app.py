@@ -88,12 +88,12 @@ def read_description():
         return "Processed livestream timelapse"
 
 def get_latest_completed_livestream(youtube):
-    """Find the latest started (not just newest published) livestream that hasn't been processed"""
+    """Find the latest started livestream that ended after 18/04/2025 with reduced API calls"""
     try:
-        logger.info("Starting livestream search...")
+        logger.info("Starting optimized livestream search...")
         processed_urls = load_processed_urls()
 
-        # First get the uploads playlist ID
+        # First get the uploads playlist ID (1 API call)
         channels_response = youtube.channels().list(
             id=CHANNEL_ID,
             part="contentDetails"
@@ -106,77 +106,95 @@ def get_latest_completed_livestream(youtube):
         uploads_playlist_id = channels_response["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
         logger.info(f"Found uploads playlist ID: {uploads_playlist_id}")
 
-        # Get all available videos from the uploads playlist
-        playlist_items = []
+        # Get only the most recent videos (limit to 100)
+        max_videos_to_check = 100
+        videos_checked = 0
+        latest_livestream = None
+        latest_start_time = None
         next_page_token = None
+        min_start_date = datetime(2025, 4, 18, 0, 0, 0).isoformat() + "Z"
 
-        while True:
+        while videos_checked < max_videos_to_check:
+            # Get batch of videos (1 API call per batch)
             playlist_response = youtube.playlistItems().list(
                 playlistId=uploads_playlist_id,
                 part="snippet",
-                maxResults=50,
+                maxResults=min(50, max_videos_to_check - videos_checked),
                 pageToken=next_page_token
             ).execute()
 
-            playlist_items.extend(playlist_response["items"])
-            next_page_token = playlist_response.get("nextPageToken")
-
-            if not next_page_token:
+            if not playlist_response.get("items"):
                 break
 
-        logger.info(f"Found {len(playlist_items)} total videos in playlist")
-
-        # We'll track the most recent started livestream
-        latest_livestream = None
-        latest_start_time = None
-
-        for item in playlist_items:
-            video_id = item["snippet"]["resourceId"]["videoId"]
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-            # Skip already processed videos
-            if video_url in processed_urls:
-                continue
-
-            video_response = youtube.videos().list(
-                id=video_id,
-                part="liveStreamingDetails,snippet",
-                fields="items(id,snippet(title),liveStreamingDetails(actualStartTime,actualEndTime))"
-            ).execute()
-
-            if not video_response.get("items"):
-                continue
-
-            video = video_response["items"][0]
-
-            # Must be a completed livestream
-            if "liveStreamingDetails" not in video:
-                continue
-            if "actualStartTime" not in video["liveStreamingDetails"]:
-                continue
-            if "actualEndTime" not in video["liveStreamingDetails"]:
-                continue
-
-            start_time = video["liveStreamingDetails"]["actualStartTime"]
-
-            # If this is the most recent started livestream we've found so far
-            if latest_start_time is None or start_time > latest_start_time:
-                latest_start_time = start_time
-                latest_livestream = {
-                    "id": video_id,
+            # Collect video IDs for batch processing
+            video_ids = []
+            video_info = {}
+            for item in playlist_response["items"]:
+                video_id = item["snippet"]["resourceId"]["videoId"]
+                video_url = f"https://www.youtube.com/watch?v={video_id}"
+                
+                if video_url in processed_urls:
+                    continue
+                
+                video_ids.append(video_id)
+                video_info[video_id] = {
                     "url": video_url,
-                    "title": video["snippet"]["title"],
-                    "startTime": start_time,
-                    "endTime": video["liveStreamingDetails"]["actualEndTime"]
+                    "title": item["snippet"]["title"],
+                    "publishedAt": item["snippet"]["publishedAt"]
                 }
-                logger.info(f"New candidate found: {video['snippet']['title']} (started: {start_time})")
+                videos_checked += 1
+
+            if not video_ids:
+                next_page_token = playlist_response.get("nextPageToken")
+                if not next_page_token:
+                    break
+                continue
+
+            # Batch get video details (1 API call per 50 videos)
+            for i in range(0, len(video_ids), 50):
+                batch_ids = video_ids[i:i+50]
+                videos_response = youtube.videos().list(
+                    id=",".join(batch_ids),
+                    part="liveStreamingDetails,snippet",
+                    fields="items(id,snippet(title),liveStreamingDetails(actualStartTime,actualEndTime))"
+                ).execute()
+
+                if not videos_response.get("items"):
+                    continue
+
+                for video in videos_response["items"]:
+                    # Must be a completed livestream
+                    if ("liveStreamingDetails" not in video or 
+                        "actualStartTime" not in video["liveStreamingDetails"] or 
+                        "actualEndTime" not in video["liveStreamingDetails"]):
+                        continue
+
+                    start_time = video["liveStreamingDetails"]["actualStartTime"]
+                    if start_time < min_start_date:
+                        continue
+
+                    # If this is the most recent started livestream we've found so far
+                    if latest_start_time is None or start_time > latest_start_time:
+                        latest_start_time = start_time
+                        latest_livestream = {
+                            "id": video["id"],
+                            "url": video_info[video["id"]]["url"],
+                            "title": video["snippet"]["title"],
+                            "startTime": start_time,
+                            "endTime": video["liveStreamingDetails"]["actualEndTime"]
+                        }
+                        logger.info(f"New candidate found: {video['snippet']['title']} (started: {start_time})")
+
+            next_page_token = playlist_response.get("nextPageToken")
+            if not next_page_token or videos_checked >= max_videos_to_check:
+                break
 
         if latest_livestream:
             logger.info(f"Selected most recently started livestream: {latest_livestream['title']}")
             logger.info(f"Started: {latest_livestream['startTime']}, Ended: {latest_livestream['endTime']}")
             return latest_livestream
 
-        logger.info("No unprocessed completed livestreams found")
+        logger.info("No unprocessed completed livestreams found that started after April 18, 2025")
         return None
 
     except HttpError as e:
