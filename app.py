@@ -106,7 +106,7 @@ def get_latest_completed_livestream(youtube):
         playlist_items = youtube.playlistItems().list(
             playlistId=uploads_playlist_id,
             part="snippet",
-            maxResults=20
+            maxResults=200
         ).execute()
 
         if not playlist_items.get("items"):
@@ -141,6 +141,113 @@ def get_latest_completed_livestream(youtube):
     except Exception as e:
         logger.error(f"Unexpected error in get_latest_completed_livestream: {e}")
         return None
+
+def old_get_latest_completed_livestream(youtube):
+    """Find the latest completed livestream from channel with improved detection"""
+    try:
+        logger.info("Starting livestream search...")
+        
+        # First get the uploads playlist ID
+        channels_response = youtube.channels().list(
+            id=CHANNEL_ID,
+            part="contentDetails"
+        ).execute()
+
+        if not channels_response.get("items"):
+            logger.error("Channel not found or no content details available")
+            return None
+
+        uploads_playlist_id = channels_response["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+        logger.info(f"Found uploads playlist ID: {uploads_playlist_id}")
+
+        # Get recent videos from the uploads playlist
+        playlist_items = youtube.playlistItems().list(
+            playlistId=uploads_playlist_id,
+            part="snippet",
+            maxResults=50  # Start with 50 for testing, can increase later
+        ).execute()
+
+        if not playlist_items.get("items"):
+            logger.error("No videos found in uploads playlist")
+            return None
+
+        logger.info(f"Checking {len(playlist_items['items'])} most recent videos...")
+        
+        # Sort items by published date (newest first) since API doesn't guarantee order
+        sorted_items = sorted(
+            playlist_items["items"],
+            key=lambda x: x["snippet"]["publishedAt"],
+            reverse=True
+        )
+        
+        for index, item in enumerate(sorted_items):
+            video_id = item["snippet"]["resourceId"]["videoId"]
+            video_title = item["snippet"]["title"]
+            published_at = item["snippet"]["publishedAt"]
+            
+            logger.info(f"\nChecking video #{index+1}: {video_title}")
+            logger.info(f"Published: {published_at} | ID: {video_id}")
+
+            # Get extended video details
+            video_response = youtube.videos().list(
+                id=video_id,
+                part="liveStreamingDetails,snippet,status,contentDetails",
+                fields="items(id,snippet(title,publishedAt,liveBroadcastContent),"
+                      "liveStreamingDetails(actualStartTime,actualEndTime),"
+                      "status(privacyStatus),contentDetails(duration))"
+            ).execute()
+
+            if not video_response.get("items"):
+                logger.info("No video details found - skipping")
+                continue
+
+            video = video_response["items"][0]
+            
+            # Skip private/deleted videos
+            if video["status"]["privacyStatus"] != "public":
+                logger.info(f"Skipping {video['status']['privacyStatus']} video")
+                continue
+
+            # Check livestream markers (multiple ways)
+            is_livestream = False
+            if "liveStreamingDetails" in video:
+                is_livestream = True
+                logger.info("Has liveStreamingDetails")
+            elif video["snippet"].get("liveBroadcastContent") == "live":
+                is_livestream = True
+                logger.info("Marked as live in snippet")
+            elif "duration" in video["contentDetails"] and video["contentDetails"]["duration"] == "P0D":
+                is_livestream = True
+                logger.info("Has 0 duration (livestream indicator)")
+
+            if not is_livestream:
+                logger.info("Not a livestream - skipping")
+                continue
+
+            # Check for completion
+            if "liveStreamingDetails" in video and "actualEndTime" in video["liveStreamingDetails"]:
+                end_time = video["liveStreamingDetails"]["actualEndTime"]
+                logger.info(f"Found COMPLETED livestream! Ended at: {end_time}")
+                return {
+                    "id": video_id,
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "title": video["snippet"]["title"],
+                    "publishedAt": video["snippet"]["publishedAt"],
+                    "endTime": end_time
+                }
+            else:
+                logger.info("Livestream found but not yet ended")
+
+        logger.info("No completed livestreams found in recent videos")
+        return None
+
+    except HttpError as e:
+        logger.error(f"YouTube API Error: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error in get_latest_completed_livestream: {e}")
+        return None
+
 
 def download_video(video_id, filename):
     """Download video using yt-dlp"""
