@@ -767,7 +767,7 @@ def process_video():
             return
 
         logger.info("Processing with FFmpeg...")
-        os.system(FFMPEG_CMD.format(input_file=input_path,random_start=random_start, output_file=output_path))
+        os.system(FFMPEG_CMD.format(input_file=input_path,random_start=random.randint(0, 1560), output_file=output_path))
 
         try:
             os.remove(input_path)
@@ -863,6 +863,22 @@ def generate_video_title(original_title, end_time):
             "Morning Sky Transformation - {date}"
         ]
     }
+    # Select a random template for the detected content type
+    template = random.choice(templates[content_type])
+    
+    # Format the date
+    end_date = datetime.strptime(end_time, "%Y-%m-%dT%H:%M:%SZ")
+    formatted_date = end_date.strftime("%B %d, %Y")
+    
+    # Fill in the template
+    speed = 60  # Your timelapse speed
+    duration = "for studying"  # You could calculate this from the livestream duration
+    
+    return template.format(
+        speed=speed,
+        date=formatted_date,
+        duration=duration
+    )
 def main():
     parser = argparse.ArgumentParser(description='YouTube Livestream Processor')
     parser.add_argument('--run-once', action='store_true', help='Run once and exit instead of scheduling')
