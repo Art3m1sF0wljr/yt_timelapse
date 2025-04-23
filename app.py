@@ -13,19 +13,21 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
-
+import random
 # Configuration
 CLIENT_SECRETS_FILE = "client_secrets_1.json"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.force-ssl"]
 API_SERVICE_NAME = "youtube"
 API_VERSION = "v3"
 TOKEN_FILE = "token.json"
-
+#####################################
+random_start = random.randint(0, 1560)
 # Livestream processing configuration
 API_KEY = ""
 CHANNEL_ID = ""
 DOWNLOAD_DIR = "./downloads"
-FFMPEG_CMD = 'ffmpeg -i "{input_file}" -r 60 -filter:v "setpts=0.00234*PTS" -vcodec libx264 -an "{output_file}"'
+AUDIO_TRACK = "lofi.mp3"
+FFMPEG_CMD = 'ffmpeg -i "{input_file}" -ss {random_start} -i lofi.mp3 -r 60 -filter:v "setpts=0.00234*PTS" -map 0:v -map 1:a -shortest -vcodec libx264 -acodec aac "{output_file}"'
 CHECK_INTERVAL = 40  # minutes
 MAX_RETRIES = 3
 URLS_FILE = "urls.txt"  # File to store processed URLs
@@ -112,7 +114,7 @@ def get_latest_completed_livestream(youtube):
         latest_livestream = None
         latest_start_time = None
         next_page_token = None
-        min_start_date = datetime(2025, 4, 18, 0, 0, 0).isoformat() + "Z"
+        min_start_date = datetime(2025, 4, 23, 0, 0, 0).isoformat() + "Z"
 
         while videos_checked < max_videos_to_check:
             # Get batch of videos (1 API call per batch)
@@ -622,7 +624,7 @@ def upload_video(youtube, file_path, title=None, description=None, privacy="publ
         "snippet": {
             "title": title,
             "description": description,
-            "tags": ["livestream", "timelapse"],
+            "tags": ["clouds timelapse","weather timelapse","relaxing sky","4K nature", "ASMR clouds"], #["livestream", "timelapse"],
             "categoryId": "22"  # People & Blogs
         },
         "status": {
@@ -765,7 +767,7 @@ def process_video():
             return
 
         logger.info("Processing with FFmpeg...")
-        os.system(FFMPEG_CMD.format(input_file=input_path, output_file=output_path))
+        os.system(FFMPEG_CMD.format(input_file=input_path,random_start=random_start, output_file=output_path))
 
         try:
             os.remove(input_path)
@@ -776,14 +778,16 @@ def process_video():
         # Upload the processed video
         logger.info("Preparing to upload video...")
         youtube_upload = get_authenticated_service()
-        video_title = f"Timelapse: {livestream['title']}"
-        description = f"Timelapse created from livestream on {livestream['endTime']}\n\nOriginal stream: {livestream['url']}"
+        #video_title = f"Timelapse: {livestream['title']}"
+        #description = f"Timelapse created from livestream on {livestream['endTime']}\n\nOriginal stream: {livestream['url']}"
+        video_title = generate_video_title(livestream["title"], livestream["endTime"])
+        description = generate_description(livestream)
         response = upload_video(youtube_upload, output_path, video_title, description)
         if response:
             logger.info("Video uploaded successfully!")
             # Get the uploaded video's URL
             uploaded_video_url = f"https://www.youtube.com/watch?v={response.get('id')}"
-            
+            #description = generate_description(livestream)
             # Update the original video's description
             if update_video_description(youtube_upload, livestream["id"], uploaded_video_url):
             	logger.info(f"Successfully updated original video description with timelapse link: {uploaded_video_url}")
@@ -798,6 +802,67 @@ def process_video():
     except Exception as e:
         logger.error(f"Unexpected error in process_video: {e}")
 
+def generate_description(livestream):
+    """Auto-generate an SEO-friendly description"""
+    end_time = datetime.strptime(livestream["endTime"], "%Y-%m-%dT%H:%M:%SZ")
+    location = "Unknown"  # You can hardcode or detect from title
+    
+    return f"""🌤️ {livestream['title']} (Timelapse Version)
+
+Watch the sky transform at {60}x speed! Filmed on {end_time.strftime('%B %d, %Y')} in {location}.
+
+► Original Livestream: {livestream['url']}
+► Subscribe for daily cloud timelapses: https://www.youtube.com/@streamraspberrypi69420
+
+This timelapse is perfect for:
+- Relaxation & stress relief
+- Background visuals for work/study
+- Weather enthusiasts
+- ASMR/sleep aid
+
+Equipment: raspberrypi camera v2
+Location: italy🇮🇹 
+
+#Clouds #Timelapse #Relaxation #Weather #Storm #Sky
+"""
+def generate_video_title(original_title, end_time):
+    """Generate optimized title based on content type"""
+    # Extract keywords from original stream title
+    keywords = {
+        "storm": ["Storm", "Thunder", "Lightning", "Rolling Clouds"],
+        "calm": ["Relaxing", "Peaceful", "Calm", "Soothing"],
+        "sunset": ["Sunset", "Golden Hour", "Dusk"],
+        "sunrise": ["Sunrise", "Dawn", "Morning Sky"]
+    }
+    
+    # Detect content type (simplified - you can improve this)
+    content_type = "calm"  # default
+    if any(word.lower() in original_title.lower() for word in keywords["storm"]):
+        content_type = "storm"
+    elif "sunset" in original_title.lower():
+        content_type = "sunset"
+    elif "sunrise" in original_title.lower():
+        content_type = "sunrise"
+    
+    # Template selection
+    templates = {
+        "storm": [
+            "⚡ {speed}x Storm Timelapse - {date}",
+            "Thunder Clouds Rolling In - {speed}x Timelapse"
+        ],
+        "calm": [
+            "☁️ {speed}x Relaxing Cloud Timelapse ({duration})",
+            "Calming Sky Motion - {speed}x Timelapse"
+        ],
+        "sunset": [
+            "🌅 Sunset Sky Timelapse - {speed}x Speed",
+            "Golden Hour Clouds - {date}"
+        ],
+        "sunrise": [
+            "🌄 Sunrise Timelapse - {speed}x Speed",
+            "Morning Sky Transformation - {date}"
+        ]
+    }
 def main():
     parser = argparse.ArgumentParser(description='YouTube Livestream Processor')
     parser.add_argument('--run-once', action='store_true', help='Run once and exit instead of scheduling')
