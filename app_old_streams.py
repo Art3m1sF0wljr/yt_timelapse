@@ -15,8 +15,8 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 # Configuration
-CLIENT_SECRETS_FILE = "client_secrets.json"
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+CLIENT_SECRETS_FILE = "client_secrets_1.json"
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.force-ssl"]
 API_SERVICE_NAME = "youtube"
 API_VERSION = "v3"
 TOKEN_FILE = "token.json"
@@ -27,6 +27,7 @@ CHANNEL_ID = ""
 PROCESSING_DIR = "./timelapse"  # Changed from DOWNLOAD_DIR to PROCESSING_DIR
 FFMPEG_CMD = 'ffmpeg -i "{input_file}" -r 60 -filter:v "setpts=0.00234*PTS" -vcodec libx264 -an "{output_file}"'
 MAX_RETRIES = 3
+RETRY_DELAY = 10  # seconds to wait between retries
 URLS_FILE = "urls.txt"  # File to store processed URLs
 NEW_URLS_FILE = "new_urls.txt"  # File to store all livestream URLs from channel
 
@@ -40,6 +41,63 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def get_livestream_info_for_urls(youtube, urls):
+    """Get full livestream info for a list of URLs"""
+    video_ids = []
+    for url in urls:
+        # Extract video ID from URL
+        if "v=" in url:
+            video_id = url.split("v=")[1].split("&")[0]
+            video_ids.append(video_id)
+    
+    livestreams = []
+    for i in range(0, len(video_ids), 50):  # Process in batches of 50
+        batch_ids = video_ids[i:i+50]
+        try:
+            videos_response = youtube.videos().list(
+                id=",".join(batch_ids),
+                part="liveStreamingDetails,snippet,status"
+            ).execute()
+            
+            for video in videos_response.get("items", []):
+                if "liveStreamingDetails" in video and "actualEndTime" in video["liveStreamingDetails"]:
+                    livestreams.append({
+                        "id": video["id"],
+                        "url": f"https://www.youtube.com/watch?v={video['id']}",
+                        "title": video["snippet"]["title"],
+                        "publishedAt": video["snippet"]["publishedAt"],
+                        "endTime": video["liveStreamingDetails"]["actualEndTime"]
+                    })
+        except HttpError as e:
+            logger.error(f"YouTube API Error while fetching video info: {e}")
+            continue
+    
+    return livestreams
+
+def get_livestreams_to_process(youtube):
+    """Get livestreams to process, prioritizing new_urls.txt if it exists and isn't empty"""
+    processed_urls = load_processed_urls()
+    
+    # First check if new_urls.txt exists and has unprocessed URLs
+    if os.path.exists(NEW_URLS_FILE) and os.path.getsize(NEW_URLS_FILE) > 0:
+        logger.info(f"Found existing {NEW_URLS_FILE}, checking for unprocessed URLs")
+        with open(NEW_URLS_FILE, "r") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        
+        unprocessed_urls = [url for url in urls if url not in processed_urls]
+        
+        if unprocessed_urls:
+            logger.info(f"Found {len(unprocessed_urls)} unprocessed URLs in {NEW_URLS_FILE}")
+            # We need to get full livestream info for these URLs
+            return get_livestream_info_for_urls(youtube, unprocessed_urls)
+        else:
+            logger.info(f"All URLs in {NEW_URLS_FILE} have already been processed")
+    
+    # If new_urls.txt is empty or doesn't exist, fetch fresh livestreams
+    logger.info("No unprocessed URLs in new_urls.txt, fetching fresh livestreams")
+    return get_all_completed_livestreams(youtube)
+
 
 def get_authenticated_service():
     """Authenticate and return the YouTube service, caching credentials"""
@@ -161,20 +219,25 @@ def get_all_completed_livestreams(youtube):
         return []
 
 def download_video(video_id, filename):
-    """Download video using yt-dlp"""
+    """Download video using yt-dlp with retry logic"""
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = {
         'outtmpl': os.path.join(PROCESSING_DIR, filename),
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return True
-    except Exception as e:
-        logger.error(f"Download failed: {e}")
-        return False
+    for attempt in range(MAX_RETRIES):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            return True
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"Download attempt {attempt + 1} failed, retrying in {RETRY_DELAY} seconds... Error: {e}")
+                time.sleep(RETRY_DELAY)
+                continue
+            logger.error(f"Download failed after {MAX_RETRIES} attempts: {e}")
+            return False
 
 def load_processed_urls():
     """Load set of already processed URLs"""
@@ -196,10 +259,10 @@ def save_processed_url(url):
         logger.error(f"Error saving URL: {e}")
 
 def upload_video(youtube, file_path, title=None, description=None, privacy="public"):
-    """Upload video to YouTube"""
+    """Upload video to YouTube with retry logic"""
     if not os.path.exists(file_path):
         logger.error(f"File not found: {file_path}")
-        return False
+        return None
 
     if title is None:
         title = os.path.splitext(os.path.basename(file_path))[0]
@@ -220,37 +283,86 @@ def upload_video(youtube, file_path, title=None, description=None, privacy="publ
         }
     }
 
+    for attempt in range(MAX_RETRIES):
+        try:
+            media = MediaFileUpload(
+                file_path,
+                chunksize=-1,
+                resumable=True
+            )
+
+            request = youtube.videos().insert(
+                part=",".join(body.keys()),
+                body=body,
+                media_body=media
+            )
+
+            logger.info(f"Upload attempt {attempt + 1} for {file_path}...")
+            response = request.execute()
+            logger.info(f"Upload successful! Video ID: {response.get('id')}")
+            return response
+        except HttpError as e:
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"YouTube API error during upload attempt {attempt + 1}, retrying in {RETRY_DELAY} seconds... Error: {e}")
+                time.sleep(RETRY_DELAY)
+                continue
+            logger.error(f"YouTube API error during upload: {e}")
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"Upload error attempt {attempt + 1}, retrying in {RETRY_DELAY} seconds... Error: {e}")
+                time.sleep(RETRY_DELAY)
+                continue
+            logger.error(f"Upload error: {e}")
+            return None
+def update_video_description(youtube, video_id, timelapse_url):
+    """Update the original video's description to include the timelapse link"""
     try:
-        media = MediaFileUpload(
-            file_path,
-            chunksize=-1,
-            resumable=True
-        )
+        # Get the current video details
+        video_response = youtube.videos().list(
+            id=video_id,
+            part="snippet"
+        ).execute()
 
-        request = youtube.videos().insert(
-            part=",".join(body.keys()),
-            body=body,
-            media_body=media
-        )
+        if not video_response.get("items"):
+            logger.error("Original video not found")
+            return False
 
-        logger.info(f"Uploading {file_path}...")
-        response = request.execute()
-        logger.info(f"Upload successful! Video ID: {response.get('id')}")
+        video = video_response["items"][0]
+        snippet = video["snippet"]
+        current_description = snippet.get("description", "")
+        
+        # Check if the timelapse link is already in the description
+        if timelapse_url in current_description:
+            logger.info("Timelapse link already exists in original video description")
+            return True
+            
+        # Add the timelapse link to the description
+        separator = "\n\n" if current_description else ""
+        new_description = f"{current_description}{separator}Timelapse version: {timelapse_url}"
+        
+        # Update the video
+        snippet["description"] = new_description
+        update_response = youtube.videos().update(
+            part="snippet",
+            body={
+                "id": video_id,
+                "snippet": snippet
+            }
+        ).execute()
+        
+        logger.info(f"Successfully updated original video description with timelapse link")
         return True
+        
     except HttpError as e:
-        logger.error(f"YouTube API error during upload: {e}")
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.error(f"YouTube API error updating description: {e}")
         return False
-
+    except Exception as e:
+        logger.error(f"Error updating video description: {e}")
+        return False
 def process_livestream(livestream):
-    """Process a single livestream: download, timelapse, upload, cleanup"""
+    """Process a single livestream: download, timelapse, upload, cleanup with retry logic"""
     logger.info(f"Processing livestream: {livestream['title']}")
     logger.info(f"Stream ended at: {livestream['endTime']}")
-
-    # Save URL before processing to avoid duplicates
-    save_processed_url(livestream["url"])
-    logger.info(f"Saved URL to {URLS_FILE}")
 
     os.makedirs(PROCESSING_DIR, exist_ok=True)
 
@@ -260,35 +372,55 @@ def process_livestream(livestream):
     output_filename = f"livestream_{timestamp}.mp4"
     output_path = os.path.join(PROCESSING_DIR, output_filename)
 
+    # Download with retries
     logger.info("Downloading video...")
     if not download_video(livestream["id"], input_filename):
-        logger.error("Failed to download video")
+        logger.error("Failed to download video after multiple attempts")
         return False
 
+    # Process with FFmpeg
     logger.info("Processing with FFmpeg...")
-    os.system(FFMPEG_CMD.format(input_file=input_path, output_file=output_path))
+    try:
+        os.system(FFMPEG_CMD.format(input_file=input_path, output_file=output_path))
+        if not os.path.exists(output_path):
+            raise Exception("FFmpeg processing failed - output file not created")
+    except Exception as e:
+        logger.error(f"Error during FFmpeg processing: {e}")
+        try:
+            os.remove(input_path)
+            logger.info(f"Cleaned up downloaded file: {input_filename}")
+        except OSError:
+            pass
+        return False
 
+    # Clean up input file
     try:
         os.remove(input_path)
         logger.info(f"Deleted downloaded video: {input_filename}")
     except OSError as e:
         logger.error(f"Error removing temporary file: {e}")
 
-    # Upload the processed video
+    # Upload with retries
     logger.info("Preparing to upload video...")
     youtube_upload = get_authenticated_service()
     video_title = f"Timelapse: {livestream['title']}"
     description = f"Timelapse created from livestream on {livestream['endTime']}\n\nOriginal stream: {livestream['url']}"
 
-    upload_success = False
-    if upload_video(youtube_upload, output_path, video_title, description):
+    #upload_success = False
+    response = upload_video(youtube_upload, output_path, video_title, description)
+    if response:
         logger.info("Video uploaded successfully!")
-        save_processed_url(livestream["url"])  # Add to urls.txt
+        uploaded_video_url = f"https://www.youtube.com/watch?v={response.get('id')}"
+        youtube = setup_youtube_client()
+        if youtube:
+            update_video_description(youtube_upload, livestream["id"], uploaded_video_url)
+        save_processed_url(livestream["url"])  # Only mark as processed after successful upload
         remove_from_new_urls(livestream["url"])  # Remove from new_urls.txt
         upload_success = True
     else:
-        logger.error("Video upload failed. Keeping local timelapse file.")
+        logger.error("Video upload failed after multiple attempts. Keeping local timelapse file.")
 
+    # Clean up output file
     try:
         os.remove(output_path)
         logger.info(f"Deleted local timelapse file: {output_filename}")
@@ -303,11 +435,11 @@ def remove_from_new_urls(url):
         # Read all lines except the one matching our URL
         with open(NEW_URLS_FILE, "r") as f:
             lines = [line.strip() for line in f if line.strip() != url]
-        
+
         # Write back the remaining lines
         with open(NEW_URLS_FILE, "w") as f:
             f.write("\n".join(lines) + "\n")
-            
+
         logger.info(f"Removed {url} from {NEW_URLS_FILE}")
     except Exception as e:
         logger.error(f"Error updating {NEW_URLS_FILE}: {e}")
@@ -315,7 +447,7 @@ def remove_from_new_urls(url):
 def process_all_videos():
     """Process all unprocessed livestreams from the channel"""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f"Checking for all unprocessed livestreams at {current_time}...")
+    logger.info(f"Checking for unprocessed livestreams at {current_time}...")
 
     try:
         youtube = setup_youtube_client()
@@ -323,7 +455,7 @@ def process_all_videos():
             logger.error("Failed to initialize YouTube client")
             return
 
-        livestreams = get_all_completed_livestreams(youtube)
+        livestreams = get_livestreams_to_process(youtube)
         if not livestreams:
             logger.info("No unprocessed livestreams found")
             return
@@ -332,13 +464,44 @@ def process_all_videos():
 
         for livestream in livestreams:
             try:
-                process_livestream(livestream)
+                success = process_livestream(livestream)
+                if not success:
+                    logger.error(f"Failed to process livestream {livestream['url']} after retries")
             except Exception as e:
                 logger.error(f"Error processing livestream {livestream['url']}: {e}")
                 continue
 
     except Exception as e:
         logger.error(f"Unexpected error in process_all_videos: {e}")
+#def process_all_videos():
+#    """Process all unprocessed livestreams from the channel"""
+#    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#    logger.info(f"Checking for all unprocessed livestreams at {current_time}...")
+#
+#    try:
+#        youtube = setup_youtube_client()
+#        if youtube is None:
+#            logger.error("Failed to initialize YouTube client")
+#            return
+#
+#        livestreams = get_all_completed_livestreams(youtube)
+#        if not livestreams:
+#            logger.info("No unprocessed livestreams found")
+#            return
+#
+#        logger.info(f"Found {len(livestreams)} unprocessed livestream(s)")
+#
+#        for livestream in livestreams:
+#            try:
+#                success = process_livestream(livestream)
+#                if not success:
+#                    logger.error(f"Failed to process livestream {livestream['url']} after #retries")
+#            except Exception as e:
+#                logger.error(f"Error processing livestream {livestream['url']}: {e}")
+#                continue
+#
+#    except Exception as e:
+#        logger.error(f"Unexpected error in process_all_videos: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='YouTube Livestream Processor')
