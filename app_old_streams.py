@@ -13,19 +13,21 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
-
+import random
 # Configuration
 CLIENT_SECRETS_FILE = "client_secrets_1.json"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.force-ssl"]
 API_SERVICE_NAME = "youtube"
 API_VERSION = "v3"
 TOKEN_FILE = "token.json"
-
+##########################################
+random_start = random.randint(0, 1560)
 # Livestream processing configuration
 API_KEY = ""
 CHANNEL_ID = ""
 PROCESSING_DIR = "./timelapse"  # Changed from DOWNLOAD_DIR to PROCESSING_DIR
-FFMPEG_CMD = 'ffmpeg -i "{input_file}" -r 60 -filter:v "setpts=0.00234*PTS" -vcodec libx264 -an "{output_file}"'
+AUDIO_TRACK = "lofi.mp3"  # Pre-downloaded royalty-free track
+FFMPEG_CMD = 'ffmpeg -i "{input_file}" -ss {random_start} -i lofi.mp3 -r 60 -filter:v "setpts=0.00234*PTS" -map 0:v -map 1:a -shortest  -vcodec libx264 -acodec aac "{output_file}"'
 MAX_RETRIES = 3
 RETRY_DELAY = 10  # seconds to wait between retries
 URLS_FILE = "urls.txt"  # File to store processed URLs
@@ -274,7 +276,8 @@ def upload_video(youtube, file_path, title=None, description=None, privacy="publ
         "snippet": {
             "title": title,
             "description": description,
-            "tags": ["livestream", "timelapse"],
+            "tags": ["clouds timelapse","weather timelapse","relaxing sky","4K nature", "ASMR clouds"],
+            #"tags": ["livestream", "timelapse"],
             "categoryId": "22"  # People & Blogs
         },
         "status": {
@@ -381,7 +384,7 @@ def process_livestream(livestream):
     # Process with FFmpeg
     logger.info("Processing with FFmpeg...")
     try:
-        os.system(FFMPEG_CMD.format(input_file=input_path, output_file=output_path))
+        os.system(FFMPEG_CMD.format(input_file=input_path, random_start=random_start, output_file=output_path))
         if not os.path.exists(output_path):
             raise Exception("FFmpeg processing failed - output file not created")
     except Exception as e:
@@ -403,9 +406,10 @@ def process_livestream(livestream):
     # Upload with retries
     logger.info("Preparing to upload video...")
     youtube_upload = get_authenticated_service()
-    video_title = f"Timelapse: {livestream['title']}"
-    description = f"Timelapse created from livestream on {livestream['endTime']}\n\nOriginal stream: {livestream['url']}"
-
+    #video_title = f"Timelapse: {livestream['title']}"
+    video_title = generate_video_title(livestream["title"], livestream["endTime"])
+    #description = f"Timelapse created from livestream on {livestream['endTime']}\n\nOriginal stream: {livestream['url']}"
+    description = generate_description(livestream)
     #upload_success = False
     response = upload_video(youtube_upload, output_path, video_title, description)
     if response:
@@ -429,6 +433,95 @@ def process_livestream(livestream):
 
     return upload_success
 
+def generate_description(livestream):
+    """Auto-generate an SEO-friendly description"""
+    end_time = datetime.strptime(livestream["endTime"], "%Y-%m-%dT%H:%M:%SZ")
+    location = "Unknown"  # You can hardcode or detect from title
+    
+    return f"""🌤️ {livestream['title']} (Timelapse Version)
+
+Watch the sky transform at {60}x speed! Filmed on {end_time.strftime('%B %d, %Y')} in {location}.
+
+► Original Livestream: {livestream['url']}
+► Subscribe for daily cloud timelapses: https://www.youtube.com/@streamraspberrypi69420
+
+This timelapse is perfect for:
+- Relaxation & stress relief
+- Background visuals for work/study
+- Weather enthusiasts
+- ASMR/sleep aid
+
+Equipment: raspberrypi camera v2
+Location: italy🇮🇹 
+
+#Clouds #Timelapse #Relaxation #Weather #Storm #Sky
+"""
+def generate_tags(livestream_title):
+    """Generate relevant tags based on content"""
+    base_tags = [
+        "clouds timelapse",
+        "weather timelapse",
+        "relaxing sky",
+        "4K nature",
+        "ASMR clouds"
+    ]
+    
+    # Add context-specific tags
+    if "storm" in livestream_title.lower():
+        base_tags.extend(["storm clouds", "thunderstorm", "lightning"])
+    elif "sunset" in livestream_title.lower():
+        base_tags.extend(["sunset sky", "golden hour", "dusk"])
+    
+    return base_tags
+
+def add_to_playlist(youtube, video_id, playlist_name="Cloud Timelapses"):
+    """Add video to a playlist (create if missing)"""
+    try:
+        # Get or create playlist
+        playlists = youtube.playlists().list(
+            part="snippet",
+            mine=True,
+            maxResults=50
+        ).execute()
+        
+        playlist_id = None
+        for pl in playlists.get("items", []):
+            if pl["snippet"]["title"] == playlist_name:
+                playlist_id = pl["id"]
+                break
+        
+        if not playlist_id:
+            # Create new playlist
+            new_playlist = youtube.playlists().insert(
+                part="snippet,status",
+                body={
+                    "snippet": {
+                        "title": playlist_name,
+                        "description": f"Auto-generated {playlist_name} collection"
+                    },
+                    "status": {
+                        "privacyStatus": "public"
+                    }
+                }
+            ).execute()
+            playlist_id = new_playlist["id"]
+        
+        # Add video
+        youtube.playlistItems().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "playlistId": playlist_id,
+                    "resourceId": {
+                        "kind": "youtube#video",
+                        "videoId": video_id
+                    }
+                }
+            }
+        ).execute()
+    except Exception as e:
+        logger.error(f"Playlist error: {e}")
+		
 def remove_from_new_urls(url):
     """Remove a URL from new_urls.txt if it exists"""
     try:
@@ -502,7 +595,55 @@ def process_all_videos():
 #
 #    except Exception as e:
 #        logger.error(f"Unexpected error in process_all_videos: {e}")
-
+def generate_video_title(original_title, end_time):
+    """Generate optimized title based on content type"""
+    # Extract keywords from original stream title
+    keywords = {
+        "storm": ["Storm", "Thunder", "Lightning", "Rolling Clouds"],
+        "calm": ["Relaxing", "Peaceful", "Calm", "Soothing"],
+        "sunset": ["Sunset", "Golden Hour", "Dusk"],
+        "sunrise": ["Sunrise", "Dawn", "Morning Sky"]
+    }
+    
+    # Detect content type (simplified - you can improve this)
+    content_type = "calm"  # default
+    if any(word.lower() in original_title.lower() for word in keywords["storm"]):
+        content_type = "storm"
+    elif "sunset" in original_title.lower():
+        content_type = "sunset"
+    elif "sunrise" in original_title.lower():
+        content_type = "sunrise"
+    
+    # Template selection
+    templates = {
+        "storm": [
+            "⚡ {speed}x Storm Timelapse - {date}",
+            "Thunder Clouds Rolling In - {speed}x Timelapse"
+        ],
+        "calm": [
+            "☁️ {speed}x Relaxing Cloud Timelapse ({duration})",
+            "Calming Sky Motion - {speed}x Timelapse"
+        ],
+        "sunset": [
+            "🌅 Sunset Sky Timelapse - {speed}x Speed",
+            "Golden Hour Clouds - {date}"
+        ],
+        "sunrise": [
+            "🌄 Sunrise Timelapse - {speed}x Speed",
+            "Morning Sky Transformation - {date}"
+        ]
+    }
+    
+    # Fill template
+    import random
+    chosen_template = random.choice(templates[content_type])
+    date_str = datetime.strptime(end_time, "%Y-%m-%dT%H:%M:%SZ").strftime("%b %d, %Y")
+    
+    return chosen_template.format(
+        speed="60x",  # Adjust based on your FFMPEG speed
+        date=date_str #,
+        #duration="1 Hour"  # Can be dynamic
+    )
 def main():
     parser = argparse.ArgumentParser(description='YouTube Livestream Processor')
     parser.add_argument('--run-once', action='store_true', help='Run once and exit (default behavior)')
