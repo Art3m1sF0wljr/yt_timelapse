@@ -384,7 +384,7 @@ def process_livestream(livestream):
     # Process with FFmpeg
     logger.info("Processing with FFmpeg...")
     try:
-        os.system(FFMPEG_CMD.format(input_file=input_path, random_start=random_start, output_file=output_path))
+        os.system(FFMPEG_CMD.format(input_file=input_path, random_start=random.randint(0, 1560), output_file=output_path))
         if not os.path.exists(output_path):
             raise Exception("FFmpeg processing failed - output file not created")
     except Exception as e:
@@ -641,8 +641,8 @@ def generate_video_title(original_title, end_time):
     
     return chosen_template.format(
         speed="60x",  # Adjust based on your FFMPEG speed
-        date=date_str #,
-        #duration="1 Hour"  # Can be dynamic
+        date=date_str,
+        duration="for studying"  # Can be dynamic
     )
 def main():
     parser = argparse.ArgumentParser(description='YouTube Livestream Processor')
