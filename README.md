@@ -1,4 +1,5 @@
-this downloads the latest livestream of channel given api by checking the last 20 videos and taking the latest livestream ended<br>
+this downloads the latest livestream of channel given api by checking the last 100 videos and taking the latest livestream ended<br>
+it actually queries the google api up to when it finds the first good one, to avoid wasting them there are 100 a day<br>
 then uses ffmpeg to create a timelapse<br>
 then uploads the timelapse on YT using client_secrets.json <br>
 required description.txt<br>
